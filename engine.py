@@ -109,6 +109,15 @@ def _game_weights(pbp: pd.DataFrame, season: int, p: Params) -> pd.Series:
 
 
 def _prep(season: int, week: int, p: Params):
+    # identical for every game in the same week, so build it once per week
+    key = ("prep", season, week, p.seasons_back, p.prior_season_weight,
+           p.older_season_weight, p.recent_games_boost)
+    if key not in _CACHE:
+        _CACHE[key] = _build_prep(season, week, p)
+    return _CACHE[key]
+
+
+def _build_prep(season: int, week: int, p: Params):
     seasons = list(range(season - p.seasons_back + 1, season + 1))
     pbp = _load("pbp", seasons)
     # only use information available before the game being simulated
@@ -320,6 +329,7 @@ def run_game(game_id: str, p: Params | None = None, seed: int | None = None, ove
     env = rng.gamma(p.game_dispersion, 1 / p.game_dispersion, p.n_sims)
 
     results, team_info, notes = [], {}, []
+    hits = {}   # player_id -> did he score in each sim (for same-game parlay correlation)
     for off, dfn, is_home in [(away, home, False), (home, away, True)]:
         lam_r, lam_p = expected_tds(rates, lg_r, lg_p, off, dfn, is_home, p)
         pm = opp_position_mults(pbp, positions, dfn, p)
@@ -328,6 +338,8 @@ def run_game(game_id: str, p: Params | None = None, seed: int | None = None, ove
         notes += [f"{off}: {x}" for x in n_]
         team_env = env * rng.gamma(p.game_dispersion * 2, 1 / (p.game_dispersion * 2), p.n_sims)
         counts, team_tds = simulate_team(df, lam_r, lam_p, team_env, rng)
+        for j, pid in enumerate(df.index):
+            hits[pid] = counts[:, j] >= 1
         team_info[off] = {"exp_rush_td": lam_r, "exp_pass_td": lam_p,
                           "sim_mean_td": team_tds.mean(),
                           "opp_pos_mult": {f"{k[0]}-{k[1]}": round(v, 2) for k, v in pm.items()
@@ -346,7 +358,10 @@ def run_game(game_id: str, p: Params | None = None, seed: int | None = None, ove
     res["fair_odds"] = res["p_anytime"].apply(prob_to_american)
     meta = {"game": g.to_dict(), "teams": team_info, "notes": list(dict.fromkeys(notes)),
             "league_rush_td_pg": lg_r, "league_pass_td_pg": lg_p,
-            "data_through": f"{season} week {week - 1}"}
+            "data_through": f"{season} week {week - 1}",
+            "n_sims": p.n_sims,
+            # bit-packed per-sim scoring indicators (8x smaller); unpack with parlays.unpack_hits
+            "hits": {pid: np.packbits(hits[pid]) for pid in res["player_id"]}}
     return res, meta
 
 

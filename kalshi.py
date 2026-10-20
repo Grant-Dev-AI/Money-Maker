@@ -106,6 +106,10 @@ def _codes(team):
 def find_event(series_ticker: str, away: str, home: str):
     """Find the open event in a series for the given matchup."""
     events = _paged("/events", "events", {"series_ticker": series_ticker, "status": "open"})
+    return _match_event(events, away, home), events
+
+
+def _match_event(events, away: str, home: str):
     best = None
     for ev in events:
         tick = (ev.get("event_ticker") or "").upper()
@@ -118,7 +122,7 @@ def find_event(series_ticker: str, away: str, home: str):
         score = 3 * strict + 2 * name_hit + code_hit
         if score and (best is None or score > best[0]):
             best = (score, ev)
-    return best[1] if best else None, events
+    return best[1] if best else None
 
 
 # ----------------------------------------------------------------------------
@@ -319,6 +323,45 @@ def fetch_game(away: str, home: str, series_override: str | None = None):
             return get_markets(ev["event_ticker"]), info
     raise KalshiError(f"No open Kalshi touchdown event found for {away} @ {home}. "
                       "Markets usually open a few days before kickoff.")
+
+
+def fetch_week(matchups, series_override: str | None = None) -> dict:
+    """Markets for many games at once. Each series' open-event list is fetched only once.
+
+    matchups: list of (away, home). Returns {(away, home): (markets_df, series, event)};
+    games with no open Kalshi event are left out.
+    """
+    tickers = [series_override.strip().upper()] if series_override else list(PREFERRED_SERIES)
+    events_by_series, out, errors = {}, {}, []
+
+    def events(t):
+        if t not in events_by_series:
+            try:
+                events_by_series[t] = _paged("/events", "events", {"series_ticker": t, "status": "open"})
+            except KalshiError as e:
+                events_by_series[t] = []
+                errors.append(str(e))
+        return events_by_series[t]
+
+    def try_series(series_list, games):
+        for away, home in games:
+            for t in series_list:
+                ev = _match_event(events(t), away, home)
+                if ev:
+                    out[(away, home)] = (get_markets(ev["event_ticker"]), t, ev)
+                    break
+
+    try_series(tickers, matchups)
+    missing = [g for g in matchups if g not in out]
+    if missing and not series_override:
+        try:
+            extra = [c["ticker"] for c in find_td_series() if c["ticker"] not in tickers]
+        except KalshiError:
+            extra = []
+        try_series(extra, missing)
+    if not out and errors:   # couldn't talk to Kalshi at all: say so instead of "no markets"
+        raise KalshiError(errors[0])
+    return out
 
 
 if __name__ == "__main__":
