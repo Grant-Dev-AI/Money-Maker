@@ -15,6 +15,8 @@ probability that fits its target:
   Cash Cow    - 2 players,   about 7x
   10 Bands    - 2-3 players, about 10x
   Longshotta  - 2-4 players, 12-15x
+
+refresh() swaps 1-3 players out of a parlay and refills it to stay in the same payout range.
 """
 from __future__ import annotations
 
@@ -115,6 +117,13 @@ def _hit_prob(combo):
     return prob
 
 
+def _fits_rules(combo):
+    """No two players from the same team, at most MAX_PER_GAME players from one game."""
+    if len({l.team for l in combo}) < len(combo):
+        return False
+    return max(Counter(l.game_id for l in combo).values()) <= MAX_PER_GAME
+
+
 def _search(legs, sizes, band, target, exclude=()):
     best = None
     for k in sizes:
@@ -122,9 +131,7 @@ def _search(legs, sizes, band, target, exclude=()):
             payout = float(np.prod([l.payout for l in combo]))
             if not band[0] <= payout <= band[1]:
                 continue
-            if len({l.team for l in combo}) < k:      # no two players from the same team
-                continue
-            if max(Counter(l.game_id for l in combo).values()) > MAX_PER_GAME:
+            if not _fits_rules(combo):
                 continue
             ids = frozenset(l.pid for l in combo)
             if ids in exclude:
@@ -137,8 +144,64 @@ def _search(legs, sizes, band, target, exclude=()):
     return best
 
 
-def suggest(sims: dict, games: pd.DataFrame, kalshi_mult: dict) -> tuple[list[Parlay], pd.DataFrame]:
-    legs = build_legs(sims, games, kalshi_mult)
+def from_ids(name: str, pids, legs: list[Leg], note: str = "") -> Parlay | None:
+    """Rebuild a parlay from player ids using this run's legs (fresh Kalshi prices).
+    Returns None if any player is no longer an eligible leg."""
+    by_id = {l.pid: l for l in legs}
+    if any(p not in by_id for p in pids):
+        return None
+    combo = [by_id[p] for p in pids]
+    return Parlay(name, combo, float(np.prod([l.payout for l in combo])), _hit_prob(combo), note)
+
+
+def refresh(parlay: Parlay, legs: list[Leg], exclude=(), rng=None) -> Parlay | None:
+    """Swap 1, 2 or 3 players out of `parlay` (picked at random, never more than it has)
+    and fill the open spots with the best model hit chance that keeps the payout in the
+    parlay's target range and follows the usual rules. Swapped-out players don't come back,
+    and any player set in `exclude` (frozensets of ids) is skipped so each refresh is new.
+    If no swap of the chosen size works, the other sizes are tried. Returns None if nothing fits."""
+    rng = rng or np.random.default_rng()
+    sizes, band, wide, target = SPECS[parlay.name]
+    n = len(parlay.legs)
+    current = {l.pid for l in parlay.legs}
+    pool = [l for l in legs if l.pid not in current]
+    counts = list(range(1, min(3, n) + 1))
+    first = int(rng.choice(counts))
+    counts = [first] + [c for c in counts if c != first]
+
+    for k in counts:
+        keep_sets = list(itertools.combinations(parlay.legs, n - k))
+        rng.shuffle(keep_sets)
+        # 1-2 open spots can draw from every leg; 3 open spots use the most likely scorers only
+        cand = pool if k <= 2 else pool[:POOL_SIZE]
+        for rng_band in (band, wide):
+            for keep in keep_sets:
+                keep_pay = float(np.prod([l.payout for l in keep])) if keep else 1.0
+                best = None
+                for add in itertools.combinations(cand, k):
+                    combo = keep + add
+                    payout = keep_pay * float(np.prod([l.payout for l in add]))
+                    if not rng_band[0] <= payout <= rng_band[1] or not _fits_rules(combo):
+                        continue
+                    if frozenset(l.pid for l in combo) in exclude:
+                        continue
+                    key = (round(_hit_prob(combo), 4), -abs(payout - target))
+                    if best is None or key > best[0]:
+                        best = (key, combo, payout)
+                if best:
+                    _, combo, payout = best
+                    kept = {l.pid for l in keep}
+                    out_names = [l.player for l in parlay.legs if l.pid not in kept]
+                    lo, hi = band
+                    note = (f"Refreshed: swapped out {', '.join(out_names)}. Best model hit chance at "
+                            f"{lo:g}–{hi:g}x" + ("." if lo <= payout <= hi else " (range widened to fit)."))
+                    return Parlay(parlay.name, list(combo), payout, _hit_prob(combo), note)
+    return None
+
+
+def suggest(sims: dict, games: pd.DataFrame, kalshi_mult: dict,
+            legs: list[Leg] | None = None) -> tuple[list[Parlay], pd.DataFrame]:
+    legs = legs if legs is not None else build_legs(sims, games, kalshi_mult)
     out, used = [], set()
     for name, (sizes, band, wide, target) in SPECS.items():
         # 2-leg searches can use every leg; 3-4 leg searches use the most likely scorers only

@@ -18,6 +18,8 @@ Opens in your browser on the homepage with two buttons:
   - *Longshotta*: 2–4 players, 12–15x
 
   Legs are priced at the live Kalshi payout (fee included) when a market exists, otherwise at the model's fair odds. Hit chance comes from the model and uses the simulation's joint odds for two legs in the same game.
+
+  Each parlay has a green **Refresh parlay** button. It swaps 1, 2 or 3 players (picked at random, never more than the parlay has) for the best replacements that keep the payout in that parlay's range and follow the same rules. Swapped-out players don't come back, and you won't see a lineup repeat (or duplicate another card) until every option has been shown. Refreshed lineups stick for that week until you restart the app, and are repriced with live Kalshi odds on every reload.
 - **Arbitrage Money Maker**: every player across the week's remaining games with a model TD probability of at least 15% and a positive edge vs Kalshi, ranked by edge (Model % − Kalshi %, fee included). Download as CSV.
 
 Both default to the current week; a dropdown at the top right switches weeks. Game script (stability 9.0) and home field (+4% TDs) use the model defaults. The first run downloads ~3 seasons of nflverse play-by-play (about 30 seconds); after that a full week simulates in a few seconds.
