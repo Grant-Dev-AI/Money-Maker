@@ -107,6 +107,13 @@ table.tbl{width:100%; border-collapse:collapse; font-size:1.05rem;}
 .stats{display:flex; justify-content:space-between; gap:8px; margin-top:8px; padding-top:8px;
   border-top:1px solid var(--line); color:var(--muted); font-size:1.05rem;}
 .stats b{color:var(--ink);}
+.card.parlay{margin-bottom:8px;}
+[class*="st-key-rf_"]{margin-bottom:18px;}
+[class*="st-key-rf_"] button{background:linear-gradient(180deg, #3fa34d, #23762f) !important;
+  border:1px solid #8fd16a !important; color:#fff !important; font-weight:700; letter-spacing:.06em;}
+[class*="st-key-rf_"] button:hover{background:linear-gradient(180deg, #4cbd5b, #2a8a38) !important;
+  color:#fff !important; border-color:#c8f5ad !important;}
+[class*="st-key-rf_"] button p{color:#fff !important;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -243,7 +250,23 @@ PARLAY_STYLE = {"Easy Money": ("💰", "var(--cash)"), "Cash Cow": ("🐄", "var
                 "10 Bands": ("💵", "#c79bff"), "Longshotta": ("🎯", "#7fc8ff")}
 
 
-def suggested_parlays(games, sims):
+def _refresh_parlay(state, pr, legs, others):
+    """Button callback: swap 1-3 players out of `pr` and remember the new lineup for this week."""
+    entry = state.setdefault(pr.name, {"ids": None, "note": "", "seen": set()})
+    entry["seen"].add(pr.ids)
+    new = parlays.refresh(pr, legs, exclude=entry["seen"] | others)
+    if new is None and len(entry["seen"]) > 1:
+        # every option has been shown once already, so start the cycle over
+        entry["seen"] = {pr.ids}
+        new = parlays.refresh(pr, legs, exclude=entry["seen"] | others)
+    if new is None:
+        entry["msg"] = f"No other {pr.name} lineup fits the payout range and rules this week."
+        return
+    entry.update(ids=[l.pid for l in new.legs], note=new.note, msg="")
+    entry["seen"].add(new.ids)
+
+
+def suggested_parlays(games, sims, season, week):
     live = games[games["result"].isna()]
     st.markdown('<p class="section">Suggested parlays</p>', unsafe_allow_html=True)
     if live.empty:
@@ -251,15 +274,29 @@ def suggested_parlays(games, sims):
         return
     with st.spinner("Building parlays…"):
         mult, note = kalshi_multipliers(live, sims)
-        picks, _ = parlays.suggest(sims, live, mult)
+        legs = parlays.build_legs(sims, live, mult)
+        picks, _ = parlays.suggest(sims, live, mult, legs)
     if not picks:
         st.info("Couldn't build a ~10x parlay within the rules for this week.")
         return
+
+    # swap in any refreshed lineups for this week (rebuilt from current prices)
+    state = st.session_state.setdefault("parlay_swaps", {}).setdefault((season, week), {})
+    for i, pr in enumerate(picks):
+        entry = state.get(pr.name)
+        if entry and entry.get("ids"):
+            rebuilt = parlays.from_ids(pr.name, entry["ids"], legs, entry["note"])
+            if rebuilt:
+                picks[i] = rebuilt
+            else:            # a player dropped out of the pool, so go back to the original
+                entry["ids"] = None
+
     cols = st.columns(2)
     for i, pr in enumerate(picks):
         c = cols[i % 2]
+        others = {p.ids for p in picks if p is not pr}
         icon, color = PARLAY_STYLE[pr.name]
-        legs = "".join(
+        leg_rows = "".join(
             f'<tr><td>{html.escape(l.player)}<div class="tm">{l.team} · {l.pos} · {l.game}</div></td>'
             f'<td class="num">{pct(l.p)}</td>'
             f'<td class="num">{l.payout:.2f}x <span class="src">{"K" if l.source == "Kalshi" else "M"}</span></td></tr>'
@@ -269,11 +306,18 @@ def suggested_parlays(games, sims):
             f'<div class="card parlay" style="border-top:4px solid {color}">'
             f'<div class="card-head"><span class="matchup" style="color:{color}">{icon} {pr.name}</span>'
             f'<span class="big">{pr.payout:.1f}x</span></div>'
-            f'<table class="tbl"><tr><th>Leg</th><th class="num">TD %</th><th class="num">Payout</th></tr>{legs}</table>'
+            f'<table class="tbl"><tr><th>Leg</th><th class="num">TD %</th><th class="num">Payout</th></tr>{leg_rows}</table>'
             f'<div class="stats"><span>Model hit chance <b>{pct(pr.hit_prob)}</b></span>'
             f'<span>EV / $1 <b class="{ev_cls}">{pr.ev:+.0%}</b></span></div>'
             f'<p class="page-note" style="font-size:.95rem;margin:4px 0 6px">{html.escape(pr.note)}</p></div>',
             unsafe_allow_html=True)
+        c.button("↻  Refresh parlay", key=f"rf_{i}", width="stretch",
+                 help="Swap 1, 2 or 3 players for a new lineup at the same target payout.",
+                 on_click=_refresh_parlay, args=(state, pr, legs, others))
+        msg = state.get(pr.name, {}).get("msg")
+        if msg:
+            c.caption(msg)
+            state[pr.name]["msg"] = ""
     st.caption(f"{note} Rules: at most 2 players per game, no two from the same team. Hit chance uses the "
                "simulation's joint odds for same-game legs, so game-script correlation is included.")
 
@@ -286,7 +330,7 @@ def page_parlay():
         st.info("No games on the schedule for this week.")
         return
     sims, errors = run_week(games)
-    suggested_parlays(games, sims)
+    suggested_parlays(games, sims, season, week)
 
     st.markdown('<p class="section">Game-by-game</p>', unsafe_allow_html=True)
     cols = st.columns(2)
