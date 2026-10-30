@@ -18,6 +18,7 @@ st.set_page_config(page_title="Money Printing Machine", page_icon="🏈", layout
 
 MIN_MODEL_PCT = 0.15     # arbitrage list: ignore players the model gives under 15%
 TOP_N = 8                # parlay view: scorers shown per game
+SLATE_MIN_PCT = 0.20     # slate sniper: ignore players the model gives under 20%
 SEED = 7
 
 # ----------------------------------------------------------------------------
@@ -48,22 +49,22 @@ h1,h2,h3,p,label,span,div{font-family:'Barlow Condensed', sans-serif;}
   text-shadow:0 4px 0 #6b4e00, 0 10px 30px rgba(0,0,0,.55);}
 .mpm-sub{text-align:center; color:var(--muted); font-size:1.15rem; letter-spacing:.3em;
   text-transform:uppercase; margin-bottom:3.5rem;}
-.st-key-go_parlay button, .st-key-go_arb button{
+.st-key-go_parlay button, .st-key-go_arb button, .st-key-go_slate button{
   min-height:150px; border-radius:18px; border:3px solid var(--gold) !important;
   background:linear-gradient(180deg, rgba(10,45,22,.92), rgba(4,22,10,.95));
   box-shadow:0 10px 30px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.06);
   transition:transform .15s ease, box-shadow .15s ease, border-color .15s ease;}
-.st-key-go_parlay, .st-key-go_arb, .mpm-title, .mpm-sub{position:relative; z-index:3;}
-.st-key-go_parlay button *, .st-key-go_arb button *{white-space:normal !important; overflow:visible !important;
-  text-overflow:clip !important;}
-.st-key-go_parlay button p, .st-key-go_arb button p{
+.st-key-go_parlay, .st-key-go_arb, .st-key-go_slate, .mpm-title, .mpm-sub{position:relative; z-index:3;}
+.st-key-go_parlay button *, .st-key-go_arb button *, .st-key-go_slate button *{white-space:normal !important;
+  overflow:visible !important; text-overflow:clip !important;}
+.st-key-go_parlay button p, .st-key-go_arb button p, .st-key-go_slate button p{
   font-family:'Graduate', 'Arial Black', Impact, sans-serif; font-size:clamp(1.3rem, 2.4vw, 1.9rem);
   color:var(--ink); line-height:1.2;}
 .stButton button, .stDownloadButton button{background:rgba(6,28,14,.85); color:var(--ink);
   border:1px solid var(--gold);}
 .stButton button:hover, .stDownloadButton button:hover{border-color:var(--cash); color:var(--cash);}
 [data-baseweb="select"] > div{background:rgba(6,28,14,.85); color:var(--ink); border-color:var(--gold);}
-.st-key-go_parlay button:hover, .st-key-go_arb button:hover{
+.st-key-go_parlay button:hover, .st-key-go_arb button:hover, .st-key-go_slate button:hover{
   transform:translateY(-4px); border-color:var(--cash) !important; box-shadow:0 16px 40px rgba(0,0,0,.55);}
 
 .rain{position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:0;}
@@ -114,6 +115,8 @@ table.tbl{width:100%; border-collapse:collapse; font-size:1.05rem;}
 [class*="st-key-rf_"] button:hover{background:linear-gradient(180deg, #4cbd5b, #2a8a38) !important;
   color:#fff !important; border-color:#c8f5ad !important;}
 [class*="st-key-rf_"] button p{color:#fff !important;}
+.slate-sum{color:var(--muted); font-size:1rem; margin:-2px 0 6px;}
+.slate-games{color:var(--muted); font-size:.95rem; margin:2px 0 8px;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -172,8 +175,9 @@ def run_week(games):
     """Simulate every game in the week, with a progress bar. Returns {game_id: (res, meta)}."""
     out, errors = {}, {}
     bar = st.progress(0.0, text="Warming up the printer… (first run downloads ~3 seasons of play-by-play)")
-    for i, g in games.iterrows():
-        bar.progress(i / len(games), text=f"Simulating {g['away_team']} @ {g['home_team']} ({i + 1}/{len(games)})")
+    n = len(games)
+    for i, (_, g) in enumerate(games.iterrows()):  # count rows ourselves: filtered frames keep their old index
+        bar.progress(min(i / n, 1.0), text=f"Simulating {g['away_team']} @ {g['home_team']} ({i + 1}/{n})")
         try:
             out[g["game_id"]] = simulate_game(g["game_id"])
         except Exception as e:  # keep the rest of the week running
@@ -215,13 +219,16 @@ def pct(x):
 def page_home():
     money_rain()
     st.markdown('<div class="mpm-title">MONEY PRINTING<br>MACHINE</div>'
-                '<div class="mpm-sub">NFL anytime touchdown model</div>', unsafe_allow_html=True)
-    _, a, gap, b, _ = st.columns([1, 4, 0.4, 4, 1])
+                '<div class="mpm-sub">NFL anytime touchdown model · v2</div>', unsafe_allow_html=True)
+    _, a, _, b, _, c, _ = st.columns([0.4, 4, 0.3, 4, 0.3, 4, 0.4])
     if a.button("🏈  Touchdown Parlay Money Maker", key="go_parlay", width="stretch"):
         st.session_state.page = "parlay"
         st.rerun()
     if b.button("💸  Arbitrage Money Maker", key="go_arb", width="stretch"):
         st.session_state.page = "arb"
+        st.rerun()
+    if c.button("🎯  Slate Sniper", key="go_slate", width="stretch"):
+        st.session_state.page = "slate"
         st.rerun()
 
 
@@ -355,10 +362,13 @@ def page_parlay():
                     f'<td><div class="bar"><i style="width:{min(100, p["p_anytime"] * 100 / 0.8):.0f}%"></i></div></td>'
                     f'<td class="num">{pct(p["p_anytime"])}</td><td class="num tm">{p["fair_odds"]}</td></tr>')
             t = meta["teams"]
+            vegas = [t[x].get("team_model", {}).get("implied_pts") for x in (away, home)]
+            vegas_txt = (f' · Vegas implied: {away} {vegas[0]:.1f} pts, {home} {vegas[1]:.1f} pts'
+                         if None not in vegas else " · no Vegas line yet (model only)")
             body = ('<table class="tbl"><tr><th></th><th>Player</th><th>Team</th><th></th>'
                     '<th class="num">TD %</th><th class="num">Fair</th></tr>' + "".join(rows) + "</table>"
                     f'<p class="page-note" style="font-size:.95rem;margin-top:6px">Expected TDs: '
-                    f'{away} {t[away]["sim_mean_td"]:.2f} · {home} {t[home]["sim_mean_td"]:.2f}</p>')
+                    f'{away} {t[away]["sim_mean_td"]:.2f} · {home} {t[home]["sim_mean_td"]:.2f}{vegas_txt}</p>')
         else:
             body = f'<p class="page-note">Couldn\'t simulate this game: {html.escape(errors.get(gid, ""))}</p>'
         cols[i % 2].markdown(
@@ -449,5 +459,101 @@ def page_arb():
                          "differences):", ", ".join(sorted(set(unmatched_all))))
 
 
-PAGES = {"home": page_home, "parlay": page_parlay, "arb": page_arb}
+# Slates in week order. Kickoff times in the schedule are Eastern.
+SLATES = [("thu", "🌙 Thursday Night"), ("sun_am", "☀️ Sunday Morning"), ("sun_pm", "🌤️ Sunday Afternoon"),
+          ("sun_night", "🌃 Sunday Night"), ("mon", "📺 Monday Night"), ("other", "📅 Bonus Games")]
+SLATE_NOTES = {"other": "Games outside the usual five slates (Wednesday, Friday or Saturday)."}
+
+
+def slate_of(g):
+    """Which slate a game belongs to, from its Eastern kickoff time.
+    Sunday morning = early window (1:00 PM ET / 10:00 AM PT, plus international games),
+    afternoon = 4:05/4:25 PM ET window, night = 7 PM ET or later."""
+    t = g["_t"]
+    if pd.isna(t):
+        return "other"
+    day = t.weekday()            # Mon=0 … Sun=6
+    if day == 3:
+        return "thu"
+    if day == 0:
+        return "mon"
+    if day == 6:
+        if t.hour < 15:
+            return "sun_am"
+        if t.hour < 19:
+            return "sun_pm"
+        return "sun_night"
+    return "other"
+
+
+def page_slate():
+    season, week = header("🎯 Slate Sniper",
+                          f"The week split into its slates. Every player the model gives at least a "
+                          f"{SLATE_MIN_PCT:.0%} anytime-TD chance, ranked from most to least likely.")
+    games = week_games(season, week)
+    if games.empty:
+        st.info("No games on the schedule for this week.")
+        return
+    sims, errors = run_week(games)
+    games["slate"] = games.apply(slate_of, axis=1)
+
+    for key, label in SLATES:
+        sg = games[games["slate"] == key]
+        if sg.empty:
+            if key != "other":
+                st.markdown(f'<p class="section">{label}</p><p class="slate-sum">No games in this slate.</p>',
+                            unsafe_allow_html=True)
+            continue
+
+        rows, matchups, failed = [], [], []
+        for _, g in sg.iterrows():
+            away, home = g["away_team"], g["home_team"]
+            final = pd.notna(g.get("result"))
+            matchups.append(f"{away} @ {home}" + (f" (FINAL {int(g['away_score'])}–{int(g['home_score'])})"
+                                                  if final else ""))
+            if g["game_id"] not in sims:
+                failed.append(f"{away} @ {home}")
+                continue
+            res = sims[g["game_id"]][0]
+            hit = res[res["p_anytime"] >= SLATE_MIN_PCT].copy()
+            hit["game"] = f"{away} @ {home}"
+            rows.append(hit)
+
+        board = (pd.concat(rows, ignore_index=True).sort_values("p_anytime", ascending=False)
+                 .reset_index(drop=True) if rows else pd.DataFrame())
+        n_games = len(sg)
+        st.markdown(
+            f'<p class="section">{label}</p>'
+            f'<p class="slate-sum">{html.escape(_kick_label_safe(sg.iloc[0]))} · '
+            f'{n_games} game{"s" if n_games != 1 else ""} · '
+            f'{len(board)} player{"s" if len(board) != 1 else ""} at {SLATE_MIN_PCT:.0%}+'
+            + (f' · {html.escape(SLATE_NOTES[key])}' if key in SLATE_NOTES else "") + "</p>",
+            unsafe_allow_html=True)
+
+        if board.empty:
+            st.markdown(f'<div class="card"><p class="slate-games">{html.escape(" · ".join(matchups))}</p>'
+                        f'<p class="page-note">No players at {SLATE_MIN_PCT:.0%} or higher in this slate.</p></div>',
+                        unsafe_allow_html=True)
+        else:
+            trs = []
+            for r, p in board.iterrows():
+                flag = (f'<span class="flag">{html.escape(str(p["status"]))}</span>'
+                        if p["status"] != "Active" else "")
+                trs.append(
+                    f'<tr><td class="rk">{r + 1}</td><td>{html.escape(p["player"])}{flag}</td>'
+                    f'<td class="tm">{p["team"]} · {p["pos"]}</td><td class="tm">{p["game"]}</td>'
+                    f'<td><div class="bar"><i style="width:{min(100, p["p_anytime"] * 100 / 0.8):.0f}%"></i></div></td>'
+                    f'<td class="num">{pct(p["p_anytime"])}</td><td class="num tm">{p["fair_odds"]}</td></tr>')
+            st.markdown(
+                '<div class="card">'
+                f'<p class="slate-games">{html.escape(" · ".join(matchups))}</p>'
+                '<table class="tbl"><tr><th></th><th>Player</th><th>Team</th><th>Game</th><th></th>'
+                '<th class="num">TD %</th><th class="num">Fair</th></tr>' + "".join(trs) + "</table></div>",
+                unsafe_allow_html=True)
+        for f in failed:
+            gid = sg.loc[(sg["away_team"] + " @ " + sg["home_team"]) == f, "game_id"].iloc[0]
+            st.caption(f"Couldn't simulate {f}: {errors.get(gid, '')}")
+
+
+PAGES = {"home": page_home, "parlay": page_parlay, "arb": page_arb, "slate": page_slate}
 PAGES[st.session_state.setdefault("page", "home")]()

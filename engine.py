@@ -55,6 +55,38 @@ class Params:
     unlisted_share: float = 0.07          # TDs going to depth players / trick plays not on the list
     redistribute_frac: float = 0.8        # share of an injured player's opps that flows to teammates on this list
 
+    # ---- v2 upgrades (each can be switched off; Params.legacy() turns them all off) ----
+    # (5) smooth recency: weight = 0.5 ** (weeks_ago / half_life); each offseason counts as extra weeks
+    use_decay: bool = True
+    team_half_life: float = 12.0          # weeks (tuned on 2024)
+    offseason_gap: float = 8.0            # extra "weeks ago" added per offseason (roster turnover)
+    player_half_life: float = 8.0         # weeks, within the current season (2.5-12 tested: all within noise)
+    # (5) snap share: a player's recent snap % vs his own average scales his share (role changes)
+    use_snaps: bool = False               # tested on 2024: no measurable gain, so off by default
+    snap_recent_games: int = 2
+    snap_beta: float = 0.5                # mult = (recent / average) ** beta
+    snap_clip: tuple = (0.6, 1.5)
+    # lineup-aware shares: recognize a starter back in the lineup (see lineup_shares)
+    use_lineup: bool = True
+    lineup_gamma: float = 3.0             # how hard to down-weight games a current starter missed
+    lineup_shrink_games: float = 2.0      # pseudo-games of the prior role for small samples
+    lineup_last_season: bool = True       # prior = role on this team last season (else: plain share this season)
+    # (2) opponent-adjusted team ratings: ridge Poisson regression  log E[TD] = mu + off + def + home
+    use_glm: bool = True
+    glm_ridge: float = 16.0               # penalty on team ratings (pseudo-games pulling toward average)
+    # (3) red-zone decomposition: E[TD] = E[RZ trips] x P(TD | trip) + E[TDs from outside the 20]
+    use_rz: bool = True
+    rz_blend: float = 1.0                 # weight of the red-zone estimate vs the direct TD-count estimate (tuned: 1.0)
+    # (1) Vegas: blend the team total implied by the spread + total (geometric blend)
+    use_vegas: bool = True
+    vegas_weight: float = 0.9             # tuned on 2024 (1.0 was marginally better; 0.9 keeps the model in the mix)
+
+    @classmethod
+    def legacy(cls, **kw):
+        """The original (v1) model: every v2 upgrade switched off."""
+        return cls(use_decay=False, use_snaps=False, use_glm=False, use_rz=False, use_vegas=False,
+                   use_lineup=False, **kw)
+
 
 # ----------------------------------------------------------------------------
 # Data loading (cached in-process)
@@ -62,14 +94,15 @@ class Params:
 _CACHE: dict = {}
 PBP_COLS = ["game_id", "season", "week", "posteam", "defteam", "play_type", "two_point_attempt",
             "rush_touchdown", "pass_touchdown", "td_team", "td_player_id", "td_player_name",
-            "rusher_player_id", "receiver_player_id", "yardline_100"]
+            "rusher_player_id", "receiver_player_id", "yardline_100", "home_team", "fixed_drive"]
 
 
 def _load(name, seasons):
     key = (name, tuple(seasons))
     if key not in _CACHE:
         fn = {"pbp": nfl.load_pbp, "sched": nfl.load_schedules,
-              "rost": nfl.load_rosters_weekly, "inj": nfl.load_injuries}[name]
+              "rost": nfl.load_rosters_weekly, "inj": nfl.load_injuries,
+              "snaps": nfl.load_snap_counts, "players": lambda _: nfl.load_players()}[name]
         try:
             if name == "pbp":
                 # load one season at a time, keep only needed columns (cuts memory ~10x)
@@ -111,7 +144,7 @@ def _game_weights(pbp: pd.DataFrame, season: int, p: Params) -> pd.Series:
 def _prep(season: int, week: int, p: Params):
     # identical for every game in the same week, so build it once per week
     key = ("prep", season, week, p.seasons_back, p.prior_season_weight,
-           p.older_season_weight, p.recent_games_boost)
+           p.older_season_weight, p.recent_games_boost, p.use_decay, p.team_half_life, p.offseason_gap)
     if key not in _CACHE:
         _CACHE[key] = _build_prep(season, week, p)
     return _CACHE[key]
@@ -123,10 +156,15 @@ def _build_prep(season: int, week: int, p: Params):
     # only use information available before the game being simulated
     pbp = pbp[(pbp["season"] < season) | (pbp["week"] < week)].copy()
     pbp = pbp[pbp["play_type"].isin(["run", "pass"]) & (pbp["two_point_attempt"] != 1)]
-    pbp["w"] = _game_weights(pbp, season, p)
-    # recent-form boost: a team's 4 most recent games this season
+    if p.use_decay:
+        # smooth exponential decay by weeks before the target game; each offseason adds extra distance
+        weeks_ago = (season - pbp["season"]) * (22 + p.offseason_gap) + week - pbp["week"]
+        pbp["w"] = 0.5 ** (weeks_ago.clip(lower=0) / p.team_half_life)
+    else:
+        pbp["w"] = _game_weights(pbp, season, p)
+    # recent-form boost: a team's 4 most recent games this season (v1 only)
     cur = pbp["season"] == season
-    if cur.any():
+    if cur.any() and not p.use_decay:
         recent = (pbp[cur].groupby("posteam")["week"]
                   .apply(lambda s: set(sorted(s.unique())[-4:])).to_dict())
         is_recent = [cur_i and wk in recent.get(t, ()) for cur_i, wk, t
@@ -165,6 +203,160 @@ def expected_tds(rates, lg_r, lg_p, off, dfn, is_home, p: Params):
 
 
 # ----------------------------------------------------------------------------
+# 1b) v2 team model: opponent-adjusted ratings, red-zone decomposition, Vegas
+# ----------------------------------------------------------------------------
+def team_games(pbp: pd.DataFrame) -> pd.DataFrame:
+    """One row per (game, offense): rush/pass TDs, red-zone trips, TDs inside / outside the 20, weight."""
+    d = pbp.assign(td=pbp["rtd"] + pbp["ptd"], inside=pbp["yardline_100"] <= 20)
+    d["rz_td"] = d["td"] * d["inside"]
+    d["rz_drive"] = np.where(d["inside"], d["fixed_drive"], np.nan)
+    g = (d.groupby(["game_id", "season", "week", "posteam", "defteam"])
+         .agg(rtd=("rtd", "sum"), ptd=("ptd", "sum"), td=("td", "sum"), rz_td=("rz_td", "sum"),
+              trips=("rz_drive", "nunique"), w=("w", "mean"), home_team=("home_team", "first"))
+         .reset_index())
+    g["long_td"] = g["td"] - g["rz_td"]
+    g["home"] = (g["posteam"] == g["home_team"]).astype(float)
+    return g
+
+
+def _design(g, teams):
+    """Columns: [intercept, offense one-hot, defense one-hot, home]."""
+    ix = {t: i for i, t in enumerate(teams)}
+    n, k = len(g), len(teams)
+    X = np.zeros((n, 2 + 2 * k))
+    X[:, 0] = 1
+    X[np.arange(n), 1 + g["posteam"].map(ix).values] = 1
+    X[np.arange(n), 1 + k + g["defteam"].map(ix).values] = 1
+    X[:, -1] = g["home"].values
+    return X
+
+
+def _fit_glm(X, y, w, ridge, family="poisson", trials=None, iters=50):
+    """Ridge-penalized GLM by Newton's method. Team ratings are penalized; intercept and home are not.
+    poisson: log link on counts y.  binomial: logit link, y successes out of `trials`."""
+    pen = np.full(X.shape[1], ridge)
+    pen[0] = pen[-1] = 1e-6
+    b = np.zeros(X.shape[1])
+    if family == "poisson":
+        b[0] = np.log(max(np.average(y, weights=w), 1e-6))
+    else:
+        b[0] = np.log(max(y.sum(), 1e-6) / max(trials.sum() - y.sum(), 1e-6))
+    for _ in range(iters):
+        eta = X @ b
+        if family == "poisson":
+            mu = np.exp(eta)
+            grad = X.T @ (w * (y - mu)) - pen * b
+            H = (X * (w * mu)[:, None]).T @ X + np.diag(pen)
+        else:
+            pr = 1 / (1 + np.exp(-eta))
+            grad = X.T @ (w * (y - trials * pr)) - pen * b
+            H = (X * (w * trials * pr * (1 - pr))[:, None]).T @ X + np.diag(pen)
+        step = np.linalg.solve(H, grad)
+        b += step
+        if np.abs(step).max() < 1e-7:
+            break
+    return b
+
+
+def _team_models(pbp, p: Params):
+    """Fit the v2 team-level models once per (season, week, params)."""
+    key = ("team_models", id(pbp), p.glm_ridge)
+    if key in _CACHE:
+        return _CACHE[key]
+    g = team_games(pbp)
+    teams = sorted(set(g["posteam"]) | set(g["defteam"]))
+    X = _design(g, teams)
+    w = g["w"].values
+    m = {"teams": teams,
+         "rush": _fit_glm(X, g["rtd"].values, w, p.glm_ridge),
+         "pass": _fit_glm(X, g["ptd"].values, w, p.glm_ridge),
+         "trips": _fit_glm(X, g["trips"].values.astype(float), w, p.glm_ridge),
+         "conv": _fit_glm(X, g["rz_td"].values.astype(float), w, p.glm_ridge, "binomial",
+                          trials=g["trips"].values.astype(float)),
+         "long": _fit_glm(X, g["long_td"].values.astype(float), w, p.glm_ridge)}
+    _CACHE[key] = m
+    return m
+
+
+def _glm_eta(b, teams, off, dfn, is_home):
+    k = len(teams)
+    ix = {t: i for i, t in enumerate(teams)}
+    eta = b[0] + b[-1] * float(is_home)
+    if off in ix:
+        eta += b[1 + ix[off]]
+    if dfn in ix:
+        eta += b[1 + k + ix[dfn]]
+    return eta
+
+
+def _vegas_fit(season, week, p: Params):
+    """Map Vegas-implied team points to offensive TDs: TDs = a + b * points, fit on past games."""
+    key = ("vegas_fit", season, week, p.seasons_back)
+    if key in _CACHE:
+        return _CACHE[key]
+    seasons = list(range(season - p.seasons_back + 1, season + 1))
+    s = _load("sched", seasons)
+    s = s[s["total_line"].notna() & s["spread_line"].notna() & s["result"].notna()
+          & ((s["season"] < season) | (s["week"] < week))]
+    pbp = _load("pbp", seasons)
+    off = pbp[pbp["play_type"].isin(["run", "pass"]) & (pbp["two_point_attempt"] != 1)
+              & ((pbp["rush_touchdown"] == 1) | (pbp["pass_touchdown"] == 1))
+              & (pbp["td_team"] == pbp["posteam"])]
+    tds = off.groupby(["game_id", "posteam"]).size()
+    rows = []
+    for _, r in s.iterrows():
+        for team, pts in ((r["home_team"], (r["total_line"] + r["spread_line"]) / 2),
+                          (r["away_team"], (r["total_line"] - r["spread_line"]) / 2)):
+            rows.append((pts, tds.get((r["game_id"], team), 0)))
+    a = np.array(rows, float)
+    if len(a) < 50:
+        fit = (0.0, 2.45 / 22.5)          # fallback: ~league average TDs per implied point
+    else:
+        b, c = np.polyfit(a[:, 0], a[:, 1], 1)
+        fit = (c, b)
+    _CACHE[key] = fit
+    return fit
+
+
+def implied_points(g, team):
+    """Vegas-implied points for `team` in schedule row g (nflverse spread_line > 0 = home favored)."""
+    tot, spr = g.get("total_line"), g.get("spread_line")
+    if tot is None or spr is None or pd.isna(tot) or pd.isna(spr):
+        return None
+    return (tot + spr) / 2 if team == g["home_team"] else (tot - spr) / 2
+
+
+def expected_tds_v2(pbp, rates, lg_r, lg_p, g, off, dfn, is_home, season, week, p: Params):
+    """Expected rushing and passing TDs with the v2 upgrades that are switched on."""
+    if p.use_glm or p.use_rz:
+        m = _team_models(pbp, p)
+    if p.use_glm:
+        lam_r = float(np.exp(_glm_eta(m["rush"], m["teams"], off, dfn, is_home)))
+        lam_p = float(np.exp(_glm_eta(m["pass"], m["teams"], off, dfn, is_home)))
+    else:
+        lam_r, lam_p = expected_tds(rates, lg_r, lg_p, off, dfn, is_home, p)
+    total = lam_r + lam_p
+    rush_frac = lam_r / total if total > 0 else 0.45
+    info = {"direct": total}
+    if p.use_rz:
+        trips = np.exp(_glm_eta(m["trips"], m["teams"], off, dfn, is_home))
+        conv = 1 / (1 + np.exp(-_glm_eta(m["conv"], m["teams"], off, dfn, is_home)))
+        long_ = np.exp(_glm_eta(m["long"], m["teams"], off, dfn, is_home))
+        rz_total = float(trips * conv + long_)
+        info.update(rz_trips=float(trips), rz_conv=float(conv), rz_total=rz_total)
+        total = p.rz_blend * rz_total + (1 - p.rz_blend) * total
+    if p.use_vegas:
+        pts = implied_points(g, off)
+        if pts is not None:
+            a, b = _vegas_fit(season, week, p)
+            vegas = max(a + b * pts, 0.3)
+            info.update(implied_pts=float(pts), vegas_td=float(vegas))
+            total = float(np.exp(p.vegas_weight * np.log(vegas) + (1 - p.vegas_weight) * np.log(total)))
+    info["final"] = total
+    return total * rush_frac, total * (1 - rush_frac), info
+
+
+# ----------------------------------------------------------------------------
 # 2) Opponent vs position (receiving + rushing TDs allowed by scorer position)
 # ----------------------------------------------------------------------------
 def opp_position_mults(pbp, positions, dfn, p: Params):
@@ -192,35 +384,166 @@ def opp_position_mults(pbp, positions, dfn, p: Params):
 # ----------------------------------------------------------------------------
 # 3) Player shares
 # ----------------------------------------------------------------------------
-def player_shares(pbp, team, season, positions, names, pos_mult, p: Params):
+def snap_mults(season, week, team, p: Params):
+    """{gsis_id: multiplier} from each player's recent offensive snap % vs his own decayed average
+    this season (only games he played, so a return from injury isn't read as a demotion)."""
+    sn = _load("snaps", [season])
+    pl = _load("players", [0])
+    if sn.empty or pl.empty:
+        return {}
+    sn = sn[(sn["season"] == sn["season"].max()) & (sn["team"] == team) & (sn["week"] < week)
+            & (sn["game_type"] == "REG") & sn["offense_pct"].notna()]
+    if sn.empty:
+        return {}
+    pfr2gsis = pl.dropna(subset=["pfr_id", "gsis_id"]).set_index("pfr_id")["gsis_id"].to_dict()
+    out = {}
+    for pfr, d in sn.groupby("pfr_player_id"):
+        gid = pfr2gsis.get(pfr)
+        if gid is None or len(d) < p.snap_recent_games + 1:
+            continue                         # not enough history to call it a role change
+        d = d.sort_values("week")
+        w = 0.5 ** ((d["week"].max() - d["week"]) / p.player_half_life)
+        avg = np.average(d["offense_pct"], weights=w)
+        recent = d["offense_pct"].tail(p.snap_recent_games).mean()
+        if avg > 0.02:
+            out[gid] = float(np.clip((max(recent, 0.01) / avg) ** p.snap_beta, *p.snap_clip))
+    return out
+
+
+_COMPS = {"carry": ("run", "rusher_player_id", None), "i10": ("run", "rusher_player_id", "i10"),
+          "rtd": ("run", "rusher_player_id", "rtd"), "tgt": ("pass", "receiver_player_id", None),
+          "rz": ("pass", "receiver_player_id", "rz"), "ptd": ("pass", "receiver_player_id", "ptd")}
+
+
+def _comp_counts(tp):
+    """{component: (games x players count matrix, games team-total series)}."""
+    out = {}
+    for c, (pt, col, m) in _COMPS.items():
+        d = tp[tp["play_type"] == pt]
+        if m == "i10":
+            d = d[d["yardline_100"] <= 10]
+        elif m == "rz":
+            d = d[d["yardline_100"] <= 20]
+        elif m in ("rtd", "ptd"):
+            d = d[d[m] == 1]
+        mat = d.groupby(["game_id", col]).size().unstack(fill_value=0)
+        out[c] = (mat, d.groupby("game_id").size())
+    return out
+
+
+def _snap_presence(tp):
+    """games x gsis_id matrix: 1 if the player took an offensive snap, 0 if the team's snap report
+    for that game doesn't list him, NaN where there is no snap report for the game."""
+    season, team = int(tp["season"].iloc[0]), tp["posteam"].iloc[0]
+    key = ("snap_presence", season, team, tuple(sorted(tp["game_id"].unique())))
+    if key in _CACHE:
+        return _CACHE[key]
+    sn, pl = _load("snaps", [season]), _load("players", [0])
+    out = None
+    if not sn.empty and not pl.empty:
+        sn = sn[(sn["team"] == team) & sn["game_id"].isin(tp["game_id"].unique())]
+        if not sn.empty:
+            m = pl.dropna(subset=["pfr_id", "gsis_id"]).drop_duplicates("pfr_id").set_index("pfr_id")["gsis_id"]
+            sn = sn.assign(gsis=sn["pfr_player_id"].map(m)).dropna(subset=["gsis"])
+            sn = sn[sn["offense_snaps"].fillna(0) > 0]
+            out = (sn.assign(v=1.0).pivot_table(index="game_id", columns="gsis", values="v", aggfunc="max")
+                   .fillna(0.0))
+    _CACHE[key] = out
+    return out
+
+
+def lineup_shares(tp, prev, p: Params):
+    """Lineup-aware opportunity shares (fixes 'starter is back' misses).
+    1. Each player's share is measured only over games he played (a suspension or injury
+       doesn't count as zero carries).
+    2. Past games where someone in the current lineup (played the team's latest game) was missing
+       are down-weighted by how big his role is, so the weeks a backup started while the starter
+       was out count less once the starter is back.
+    3. Small samples are shrunk toward the player's role on this team last season (or, without
+       one, toward his plain share this season), then shares are re-normalized to add up."""
+    games = tp.groupby("game_id")["week"].first().sort_values()
+    gid = games.index
+    gw = tp.groupby("game_id")["rw"].first().reindex(gid).values
+    cc = _comp_counts(tp)
+    ids = sorted(set(cc["carry"][0].columns) | set(cc["tgt"][0].columns))
+    cnt = {c: m.reindex(index=gid, columns=ids, fill_value=0).values.astype(float) for c, (m, _) in cc.items()}
+    tot = {c: t.reindex(gid, fill_value=0).values.astype(float) for c, (_, t) in cc.items()}
+    app = ((cnt["carry"] + cnt["tgt"]) > 0).astype(float)          # games x players: did he play
+    on_field = _snap_presence(tp)
+    if on_field is not None:
+        # snap counts know who was on the field even without a touch (a WR with no targets still played)
+        on = on_field.reindex(index=gid, columns=ids).values
+        app = np.where(np.isnan(on), app, np.maximum(app, np.nan_to_num(on)))
+
+    def ingame(c, w):
+        num = (cnt[c] * w[:, None]).sum(0)
+        den = (app * (tot[c] * w)[:, None]).sum(0)
+        return np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+
+    active = app[-1] > 0                                           # in the lineup in the latest game
+    weights = {}
+    for side, base in (("run", "carry"), ("pass", "tgt")):
+        s0 = ingame(base, gw)
+        missing = ((1 - app) * (s0 * active)[None, :]).sum(1)     # role size of active players absent that game
+        weights[side] = gw * np.exp(-p.lineup_gamma * missing)
+
+    prior_cc = _comp_counts(prev) if len(prev) else {}
+    df = pd.DataFrame(index=ids)
+    for c, (pt, _, _) in _COMPS.items():
+        w = weights[pt]
+        s = ingame(c, w)
+        n_eff = (app * w[:, None]).sum(0) / max(w.max(), 1e-9)    # effective games played
+        total_w = (tot[c] * w).sum()
+        raw = (cnt[c] * w[:, None]).sum(0) / total_w if total_w > 0 else np.zeros(len(ids))
+        prior = raw.copy()
+        if p.lineup_last_season and c in prior_cc and prior_cc[c][1].sum() > 0:
+            pm, pt_ = prior_cc[c]
+            last = (pm.sum(0) / pt_.sum()).reindex(ids)
+            prior = np.where(last.notna(), last.fillna(0).values, raw)
+        k = p.lineup_shrink_games
+        shr = (n_eff * s + k * prior) / (n_eff + k)
+        target = 1.0 if total_w > 0 else 0.0
+        df[c] = shr * target / shr.sum() if shr.sum() > 0 else 0.0
+    return df
+
+
+def player_shares(pbp, team, season, positions, names, pos_mult, p: Params, snap_mult=None):
     tp = pbp[(pbp["posteam"] == team) & (pbp["season"] == season)]
     if tp.empty:  # early season fallback: last season for this team
         tp = pbp[(pbp["posteam"] == team) & (pbp["season"] == season - 1)]
     # recency-weight within season (later weeks count more)
     wk = tp["week"]
-    rw = 1 + (wk - wk.min()) / max(1, (wk.max() - wk.min())) if len(tp) else wk
+    if p.use_decay and len(tp):
+        rw = 0.5 ** ((wk.max() - wk) / p.player_half_life)
+    else:
+        rw = 1 + (wk - wk.min()) / max(1, (wk.max() - wk.min())) if len(tp) else wk
     tp = tp.assign(rw=rw)
 
     runs = tp[tp["play_type"] == "run"]
     passes = tp[tp["play_type"] == "pass"]
 
-    def share(df, idcol, mask=None):
-        d = df if mask is None else df[mask]
-        s = d.groupby(idcol)["rw"].sum()
-        return s / s.sum() if s.sum() > 0 else s
+    if p.use_lineup and len(tp):
+        prev = pbp[(pbp["posteam"] == team) & (pbp["season"] == tp["season"].iloc[0] - 1)]
+        df = lineup_shares(tp, prev, p)
+        ids = list(df.index)
+    else:
+        def share(df, idcol, mask=None):
+            d = df if mask is None else df[mask]
+            s = d.groupby(idcol)["rw"].sum()
+            return s / s.sum() if s.sum() > 0 else s
 
-    carry = share(runs, "rusher_player_id")
-    i10 = share(runs, "rusher_player_id", runs["yardline_100"] <= 10)
-    rtd = share(runs, "rusher_player_id", runs["rtd"] == 1)
-    tgt = share(passes, "receiver_player_id")
-    rz = share(passes, "receiver_player_id", passes["yardline_100"] <= 20)
-    ptd = share(passes, "receiver_player_id", passes["ptd"] == 1)
+        carry = share(runs, "rusher_player_id")
+        i10 = share(runs, "rusher_player_id", runs["yardline_100"] <= 10)
+        rtd = share(runs, "rusher_player_id", runs["rtd"] == 1)
+        tgt = share(passes, "receiver_player_id")
+        rz = share(passes, "receiver_player_id", passes["yardline_100"] <= 20)
+        ptd = share(passes, "receiver_player_id", passes["ptd"] == 1)
 
-    ids = sorted(set(carry.index) | set(tgt.index))
-    df = pd.DataFrame(index=ids)
-    for nm, s in [("carry", carry), ("i10", i10), ("rtd", rtd),
-                  ("tgt", tgt), ("rz", rz), ("ptd", ptd)]:
-        df[nm] = s.reindex(ids).fillna(0.0)
+        ids = sorted(set(carry.index) | set(tgt.index))
+        df = pd.DataFrame(index=ids)
+        for nm, s in [("carry", carry), ("i10", i10), ("rtd", rtd),
+                      ("tgt", tgt), ("rz", rz), ("ptd", ptd)]:
+            df[nm] = s.reindex(ids).fillna(0.0)
 
     rw_, cw = p.rush_w, p.rec_w
     df["rush_share"] = rw_["carry"] * df["carry"] + rw_["i10"] * df["i10"] + rw_["td"] * df["rtd"]
@@ -239,6 +562,11 @@ def player_shares(pbp, team, season, positions, names, pos_mult, p: Params):
     df["name"] = [names.get(i, i) for i in ids]
     df["rush_share"] *= df["skill"] * [pos_mult.get(("rush", x), 1.0) for x in df["pos"]]
     df["rec_share"] *= df["skill"] * [pos_mult.get(("rec", x), 1.0) for x in df["pos"]]
+    if snap_mult:
+        sm = np.array([snap_mult.get(i, 1.0) for i in ids])
+        df["snap_mult"] = sm
+        df["rush_share"] *= sm
+        df["rec_share"] *= sm
     for c in ["rush_share", "rec_share"]:
         df[c] = df[c] ** p.share_temper
         if df[c].sum() > 0:
@@ -331,9 +659,10 @@ def run_game(game_id: str, p: Params | None = None, seed: int | None = None, ove
     results, team_info, notes = [], {}, []
     hits = {}   # player_id -> did he score in each sim (for same-game parlay correlation)
     for off, dfn, is_home in [(away, home, False), (home, away, True)]:
-        lam_r, lam_p = expected_tds(rates, lg_r, lg_p, off, dfn, is_home, p)
+        lam_r, lam_p, tinfo = expected_tds_v2(pbp, rates, lg_r, lg_p, g, off, dfn, is_home, season, week, p)
         pm = opp_position_mults(pbp, positions, dfn, p)
-        df = player_shares(pbp, off, season, positions, names, pm, p)
+        sm = snap_mults(season, week, off, p) if p.use_snaps else None
+        df = player_shares(pbp, off, season, positions, names, pm, p, sm)
         df, n_ = apply_availability(df, off, season, week, p, overrides)
         notes += [f"{off}: {x}" for x in n_]
         team_env = env * rng.gamma(p.game_dispersion * 2, 1 / (p.game_dispersion * 2), p.n_sims)
@@ -341,7 +670,7 @@ def run_game(game_id: str, p: Params | None = None, seed: int | None = None, ove
         for j, pid in enumerate(df.index):
             hits[pid] = counts[:, j] >= 1
         team_info[off] = {"exp_rush_td": lam_r, "exp_pass_td": lam_p,
-                          "sim_mean_td": team_tds.mean(),
+                          "sim_mean_td": team_tds.mean(), "team_model": tinfo,
                           "opp_pos_mult": {f"{k[0]}-{k[1]}": round(v, 2) for k, v in pm.items()
                                            if k[1] in ("RB", "WR", "TE", "QB")}}
         out = pd.DataFrame({
